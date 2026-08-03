@@ -371,8 +371,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
             // Check for terminal error states
             if (state == "FAILED")
             {
-                var error = response.Status?.Error;
-                throw new AdbcException($"Statement execution failed: {error?.Message ?? "Unknown error"} (Error Code: {error?.ErrorCode})");
+                throw NewFailedStateException(response.Status?.Error);
             }
             if (state == "CANCELED")
             {
@@ -721,8 +720,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
             // Check for terminal error states
             if (state == "FAILED")
             {
-                var error = response.Status?.Error;
-                throw new AdbcException($"Statement execution failed: {error?.Message ?? "Unknown error"} (Error Code: {error?.ErrorCode})");
+                throw NewFailedStateException(response.Status?.Error);
             }
             if (state == "CANCELED")
             {
@@ -1031,9 +1029,11 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 // has NOT asked for wildcards to be escaped. With escape_pattern_wildcards=true
                 // the caller wants "%" treated LITERALLY, matching the Thrift path (which
                 // escapes "%" -> "\%", a literal catalog that matches nothing -> 0 rows).
-                // In that case we leave "%" as a literal identifier; SHOW ... IN `%` yields
-                // SCHEMA_NOT_FOUND, already caught by the IsObjectNotFoundException handlers
-                // and mapped to an empty result.
+                // In that case we leave "%" as a literal identifier here, so the metadata
+                // method issues SHOW ... IN `%`; the server returns SCHEMA_NOT_FOUND and the
+                // IsObjectNotFoundException catch maps it to an empty result — matching
+                // Thrift's 0 rows. (There is no separate pre-SHOW short-circuit; the general
+                // object-not-found catch handles this uniformly with every other not-found case.)
                 if (IsMatchAllCatalogPattern(catalog) && !_escapePatternWildcards)
                     catalog = null;
 
@@ -1060,12 +1060,90 @@ namespace AdbcDrivers.Databricks.StatementExecution
         /// Escapes wildcard characters (_ and %) in metadata name parameters when
         /// EscapePatternWildcards is enabled. This prevents literal underscores or
         /// percent signs in identifiers from being treated as pattern wildcards.
+        ///
+        /// When escape_pattern_wildcards=true the input is a LITERAL object name, not
+        /// a pattern: every character is literal content, INCLUDING backslash. All
+        /// three pattern metacharacters are therefore escaped unconditionally — \ → \\,
+        /// _ → \_, % → \% — with backslash escaped first so the backslashes we introduce
+        /// for _/% are not themselves doubled. There is no "already-escaped" pass-through:
+        /// under escape=true a leading '\' is a literal backslash in the object name, so
+        /// it must be escaped too. An idempotency heuristic ("if I see \_, assume the
+        /// caller pre-escaped and pass it through") cannot distinguish a caller-intended
+        /// literal backslash from a pre-escape, and so silently drops literal backslashes
+        /// and matches the wrong object — verified live thrift-vs-rest against schemas
+        /// named a\b / a\_b / a\\b.
+        ///
+        /// This is Layer 1 of two complementary escaping layers: it maps a literal name
+        /// to a LIKE pattern. Layer 2 (LikePattern) then maps the LIKE glob to a SQL
+        /// string literal by doubling backslashes, because the glob is embedded in '...'
+        /// and the server's string-literal parser consumes one backslash layer before the
+        /// LIKE regex. The same under-escaping exists in the JDBC reference driver
+        /// (databricks-jdbc#1598).
         /// </summary>
         private string? EscapePatternWildcardsInName(string? name)
         {
             if (!_escapePatternWildcards || name == null)
                 return name;
-            return name.Replace("_", "\\_").Replace("%", "\\%");
+
+            // escape_pattern_wildcards=true means the input is a LITERAL object name,
+            // not a pattern: every character is literal content, including backslash.
+            // Escape all three pattern metacharacters so the name matches literally.
+            // Backslash MUST be escaped first, or the backslashes we introduce for _/%
+            // would themselves be doubled. No idempotency / "already-escaped" detection:
+            // under escape=true there are no escape sequences in the input to preserve —
+            // a leading '\' is a literal backslash in the name, so it must be escaped too.
+            // (Verified live thrift-vs-rest against schemas named a\b / a\_b / a\\b: the
+            // "already-escaped pass-through" heuristic silently dropped literal backslashes
+            // and matched the wrong object.)
+            var sb = new System.Text.StringBuilder(name.Length);
+            for (int i = 0; i < name.Length; i++)
+            {
+                char c = name[i];
+                if (c == '\\')
+                {
+                    sb.Append("\\\\");
+                }
+                else if (c == '_')
+                {
+                    sb.Append("\\_");
+                }
+                else if (c == '%')
+                {
+                    sb.Append("\\%");
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Builds the exception thrown when a statement resolves to FAILED on the async
+        /// polling path. Throws DatabricksException — the SAME concrete type as the
+        /// synchronous FAILED path in StatementExecutionClient.ExecuteStatementAsync — so
+        /// the two SEA FAILED paths are type-consistent regardless of whether the initial
+        /// response was immediately FAILED or resolved to FAILED after PENDING/RUNNING
+        /// (the consistency thread the reviewer raised). DatabricksException is the natural
+        /// SEA type; cross-protocol parity with the Thrift path (HiveServer2Exception) is
+        /// enforced by the comparator on Status + SqlState — any AdbcException subclass is
+        /// equivalent to it — not on the concrete type. SqlState/NativeError are populated
+        /// from the server error. Metadata queries usually resolve synchronously via the
+        /// can-run-fully-sync header, but a slow warehouse can push them onto this polling
+        /// path — this keeps object-not-found and other failures consistent regardless of
+        /// timing.
+        /// </summary>
+        private static DatabricksException NewFailedStateException(StatementError? error)
+        {
+            var ex = new DatabricksException(
+                $"Statement execution failed: {error?.Message ?? "Unknown error"} (Error Code: {error?.ErrorCode})",
+                AdbcStatusCode.InternalError);
+            if (error?.SqlState != null)
+                ex.SetSqlState(error.SqlState);
+            if (error?.ErrorCode != null && int.TryParse(error.ErrorCode, out int nativeError))
+                ex.SetNativeError(nativeError);
+            return ex;
         }
 
         private Task<QueryResult> ExecuteMetadataCommandAsync(CancellationToken cancellationToken)
@@ -1146,6 +1224,11 @@ namespace AdbcDrivers.Databricks.StatementExecution
                     EscapePatternWildcardsInName(_metadataSchemaName)).Build();
                 activity?.SetTag("sql_query", sql);
 
+                // Object-not-found (missing catalog/schema/table, or the server rejecting
+                // an empty/invalid name) → return an EMPTY result, matching both the Thrift
+                // path and the JDBC reference driver (isObjectNotFoundException). Restores
+                // the #388 behavior; the "make SEA throw" premise was disproven — Thrift
+                // returns empty on object-not-found too.
                 List<RecordBatch> batches;
                 try
                 {
@@ -1433,11 +1516,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
             {
                 batches = await _connection.ExecuteMetadataSqlAsync(query, cancellationToken).ConfigureAwait(false);
             }
-            catch (DatabricksException ex) when (ex.IsObjectNotFoundException())
-            {
-                return CreateEmptyExtendedColumnsResult(MetadataSchemaFactory.CreateColumnMetadataSchema());
-            }
-            catch (DatabricksException ex) when (ex.IsDescTableExtendedUnsupportedException())
+            catch (AdbcException ex) when (DatabricksException.IsDescTableExtendedUnsupported(ex))
             {
                 // The runtime does not support `DESC TABLE EXTENDED ... AS JSON [STATIC ONLY]`
                 // (e.g. STATIC ONLY on a DBR without PR #198486 → 42601 parse error, or 20000).
@@ -1445,6 +1524,12 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 // (DatabricksStatement.GetColumnsExtendedAsync). This keeps the fast-metadata
                 // opt-in safe to roll out before the runtime change reaches every endpoint.
                 return await GetColumnsExtendedViaThreeCalls(cancellationToken).ConfigureAwait(false);
+            }
+            catch (DatabricksException ex) when (ex.IsObjectNotFoundException())
+            {
+                // Missing catalog/schema/table (or invalid/empty name) → empty result,
+                // matching Thrift + JDBC (see GetSchemasAsync).
+                return CreateEmptyExtendedColumnsResult(MetadataSchemaFactory.CreateColumnMetadataSchema());
             }
 
             string? resultJson = null;
@@ -1554,8 +1639,8 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 if (MetadataUtilities.ShouldReturnEmptyPKFKResult(_metadataCatalogName, null, _connection.EnablePKFK))
                     return MetadataSchemaFactory.CreateEmptyPrimaryKeysResult();
 
-                if (string.IsNullOrEmpty(_metadataCatalogName) || string.IsNullOrEmpty(_metadataSchemaName) ||
-                    string.IsNullOrEmpty(_metadataTableName))
+                if (string.IsNullOrEmpty(_metadataCatalogName) || string.IsNullOrEmpty(_metadataSchemaName)
+                    || string.IsNullOrEmpty(_metadataTableName))
                     return MetadataSchemaFactory.CreateEmptyPrimaryKeysResult();
 
                 string sql = new ShowKeysCommand(_metadataCatalogName!, _metadataSchemaName!, _metadataTableName!).Build();
