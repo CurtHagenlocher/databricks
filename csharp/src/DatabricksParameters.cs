@@ -395,6 +395,7 @@ namespace AdbcDrivers.Databricks
         [FeatureFlagType(FeatureFlagValueKind.PositiveInt)]
         public const string OperationStatusRequestTimeout = "adbc.databricks.operation_status_request_timeout";
 
+
         // Statement Execution API configuration parameters
 
         /// <summary>
@@ -436,21 +437,28 @@ namespace AdbcDrivers.Databricks
         public const string ResultFormat = "adbc.databricks.rest.result_format";
 
         /// <summary>
-        /// Result compression codec for Statement Execution API.
-        /// Supported values:
-        /// - "lz4": LZ4 compression (default for external_links)
-        /// - "gzip": GZIP compression
-        /// - "none": No compression (default for inline)
+        /// Deprecated and ignored. This key is recognized but inert: it is no longer read, and
+        /// setting it has no effect. Result compression is derived solely from the
+        /// "adbc.databricks.cloudfetch.lz4.enabled" capability flag: "LZ4_FRAME" is requested
+        /// whenever the client can decompress it (the default), regardless of result format, and
+        /// "NONE" is requested when LZ4 is disabled. The single LZ4 capability flag drives
+        /// compression across both the Thrift/CloudFetch and REST paths. The server ignores the
+        /// codec for non-Arrow formats (e.g. JSON_ARRAY, CSV) and still returns results
+        /// uncompressed when it chooses to (e.g. small inline results); the reader honors the
+        /// response manifest either way.
         /// Only applicable when Protocol is "rest".
         /// </summary>
+        [System.Obsolete("Ignored: result compression is controlled by adbc.databricks.cloudfetch.lz4.enabled. This key has no effect and will be removed in a future major release.")]
         public const string ResultCompression = "adbc.databricks.rest.result_compression";
 
         /// <summary>
-        /// Wait timeout for statement execution in seconds.
-        /// - 0: Async mode, return immediately
-        /// - 5-50: Sync mode up to timeout
-        /// Default: 10 seconds
-        /// Note: When enable_direct_results=true, this parameter is not set (server waits until complete)
+        /// Deprecated and ignored. This key is recognized but inert: it is no longer read, and
+        /// setting it has no effect. The request wait_timeout is now derived solely from the
+        /// enable_direct_results flag (see StatementExecutionConnection.ValidateProperties):
+        /// - enable_direct_results=true: wait_timeout is not set (server waits until complete).
+        /// - enable_direct_results=false: wait_timeout="0s" (fully async, then poll).
+        /// A non-zero wait_timeout is deliberately never sent, since a positive value routes the
+        /// request to the SEA sync-hybrid results path, which truncates multi-chunk results.
         /// Only applicable when Protocol is "rest".
         /// </summary>
         [FeatureFlagType(FeatureFlagValueKind.Int)]
@@ -495,6 +503,28 @@ namespace AdbcDrivers.Databricks
         /// </summary>
         [FeatureFlagType(FeatureFlagValueKind.Boolean)]
         public const string EnableComplexDatatypeSupport = "adbc.databricks.enable_complex_datatype_support";
+
+        /// <summary>
+        /// Connection option (boolean, default false): opt in to statement-level catalog scoping.
+        /// When enabled, a non-metadata statement whose catalog (adbc.get_metadata.target_catalog,
+        /// i.e. CatalogName) differs from the session's current catalog causes the driver to issue
+        /// a standalone USE CATALOG on the session before executing — so a query using a bare
+        /// 2-level `schema`.`table` name resolves against that catalog. Issued only on change
+        /// (the current catalog is tracked in memory), matching the ODBC driver. When disabled
+        /// (default), no USE CATALOG is issued (pre-fix behavior). Not applied to metadata
+        /// commands, driver-internal statements, the SPARK legacy alias, or when multiple-catalog
+        /// support is off. See ES-2115589.
+        ///
+        /// This scopes session-global state (the server-side current catalog is per session, and
+        /// all statements on one connection share that session) and is best-effort, not
+        /// per-statement isolated: the check-then-USE-CATALOG-then-track sequence is not atomic.
+        /// If two statements run concurrently on the same connection, their USE CATALOG and query
+        /// can interleave, so a query may execute against the other statement's catalog. Do not
+        /// assume per-statement catalog isolation when executing statements concurrently on a
+        /// single connection.
+        /// </summary>
+        [FeatureFlagType(FeatureFlagValueKind.Boolean)]
+        public const string ScopeCurrentCatalog = "adbc.databricks.scope_current_catalog";
     }
 
     /// <summary>
@@ -506,6 +536,7 @@ namespace AdbcDrivers.Databricks
         /// HTTP header for passing the Databricks organization ID on REST requests.
         /// </summary>
         public const string OrgIdHeader = "x-databricks-org-id";
+
         /// <summary>
         /// Default heartbeat interval in seconds for long-running operations.
         /// </summary>
@@ -515,6 +546,14 @@ namespace AdbcDrivers.Databricks
         /// Default timeout in seconds for operation status polling requests.
         /// </summary>
         public const int DefaultOperationStatusRequestTimeoutSeconds = 30;
+
+        /// <summary>
+        /// Default query timeout in seconds for the Statement Execution (REST) path. Applies to both
+        /// regular queries (poll-until-complete) and metadata operations (which are just queries).
+        /// Matches the Thrift path's Databricks default (<c>DatabricksConnection.DefaultQueryTimeSeconds</c>)
+        /// so a long-running query is bounded consistently across protocols. 0 disables the timeout.
+        /// </summary>
+        public const int DefaultQueryTimeoutSeconds = 3 * 60 * 60; // 3 hours
 
         /// <summary>
         /// Default async execution poll interval in milliseconds.

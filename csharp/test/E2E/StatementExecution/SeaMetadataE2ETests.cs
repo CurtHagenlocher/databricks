@@ -84,11 +84,12 @@ namespace AdbcDrivers.Databricks.Tests.E2E.StatementExecution
 
         private async Task<List<Dictionary<string, string>>> ReadMetadata(AdbcConnection connection, string command,
             string? catalog = null, string? schema = null, string? table = null, string? column = null,
-            string? tableTypes = null)
+            string? tableTypes = null, bool escapeWildcards = false)
         {
             var results = new List<Dictionary<string, string>>();
             using var stmt = connection.CreateStatement();
             stmt.SetOption(ApacheParameters.IsMetadataCommand, "true");
+            if (escapeWildcards) stmt.SetOption(ApacheParameters.EscapePatternWildcards, "true");
             if (catalog != null) stmt.SetOption(ApacheParameters.CatalogName, catalog);
             if (schema != null) stmt.SetOption(ApacheParameters.SchemaName, schema);
             if (table != null) stmt.SetOption(ApacheParameters.TableName, table);
@@ -184,6 +185,58 @@ namespace AdbcDrivers.Databricks.Tests.E2E.StatementExecution
             // Lowercase "table" does NOT match the uppercase server type -> no rows.
             var lowerRows = await ReadMetadata(conn, "GetTables", TestCatalog, TestSchema, TestTable, tableTypes: "table");
             Assert.DoesNotContain(lowerRows, r => r["TABLE_NAME"] == TestTable);
+        }
+
+        // --- Issue #593: catalog match-all "%" must honor escape_pattern_wildcards ---
+        //
+        // When escape_pattern_wildcards=true the caller has asked for wildcards to be
+        // treated LITERALLY. The Thrift path escapes catalog="%" -> "\%", which matches
+        // no catalog and returns 0 rows. SEA previously intercepted "%" as "all catalogs"
+        // (null) BEFORE checking the escape flag and returned rows from every catalog,
+        // diverging from Thrift. With escaping on, SEA must also return an empty result.
+
+        // The bug is SEA-specific, so these tests force the REST/SEA path explicitly
+        // rather than relying on the run's configured protocol.
+        private static readonly Dictionary<string, string> RestProtocol =
+            new() { { DatabricksParameters.Protocol, "rest" } };
+
+        [SkippableFact]
+        public async Task GetColumns_CatalogMatchAll_WithEscaping_ReturnsEmpty()
+        {
+            SkipIfNotConfigured();
+            using var conn = CreateConnection(RestProtocol);
+            var rows = await ReadMetadata(conn, "GetColumns", "%", TestSchema, TestTable, escapeWildcards: true);
+            Assert.Empty(rows);
+        }
+
+        [SkippableFact]
+        public async Task GetTables_CatalogMatchAll_WithEscaping_ReturnsEmpty()
+        {
+            SkipIfNotConfigured();
+            using var conn = CreateConnection(RestProtocol);
+            var rows = await ReadMetadata(conn, "GetTables", "%", TestSchema, TestTable, escapeWildcards: true);
+            Assert.Empty(rows);
+        }
+
+        [SkippableFact]
+        public async Task GetSchemas_CatalogMatchAll_WithEscaping_ReturnsEmpty()
+        {
+            SkipIfNotConfigured();
+            using var conn = CreateConnection(RestProtocol);
+            var rows = await ReadMetadata(conn, "GetSchemas", "%", TestSchema, escapeWildcards: true);
+            Assert.Empty(rows);
+        }
+
+        // Regression guard: with escaping OFF (default), catalog="%" must still be
+        // treated as match-all and return rows for the concrete schema/table.
+        [SkippableFact]
+        public async Task GetColumns_CatalogMatchAll_NoEscaping_ReturnsRows()
+        {
+            SkipIfNotConfigured();
+            using var conn = CreateConnection(RestProtocol);
+            var rows = await ReadMetadata(conn, "GetColumns", "%", TestSchema, TestTable, escapeWildcards: false);
+            Assert.NotEmpty(rows);
+            Assert.Contains(rows, r => r["TABLE_NAME"] == TestTable);
         }
 
         // --- GetColumnsExtended ---
@@ -282,6 +335,37 @@ namespace AdbcDrivers.Databricks.Tests.E2E.StatementExecution
             Assert.Equal(2, rows.Count);
             Assert.Equal("c_string", rows[0]["COLUMN_NAME"]);
             Assert.Equal("c_int", rows[1]["COLUMN_NAME"]);
+        }
+
+        // Case-variant input: querying with an uppercase table name must still match (identifiers
+        // are case-insensitive), and the result rows' TABLE_CAT/TABLE_SCHEM/TABLE_NAME must reflect
+        // the server's stored (canonical, lowercase) casing — NOT the uppercase input echoed back.
+        // Thrift and the JDBC reference driver both return the server's casing; SEA previously
+        // echoed the input, diverging on every case-variant PK query. Regression guard for that fix.
+        // The bug is SEA-specific, so force the REST/SEA path explicitly (matching the #593 tests
+        // above) rather than relying on the run's configured protocol — on a Thrift-configured run
+        // the default connection would pass trivially without exercising the fixed code path.
+        [SkippableFact]
+        public async Task GetPrimaryKeys_UppercaseTableName_ReturnsServerCanonicalCasing()
+        {
+            SkipIfNotConfigured();
+            using var conn = CreateConnection(RestProtocol);
+            var rows = await ReadMetadata(
+                conn, "GetPrimaryKeys", TestCatalog, TestSchema, TestTable.ToUpperInvariant());
+
+            // Case-insensitive match still finds the two PK columns.
+            Assert.Equal(2, rows.Count);
+            Assert.Equal("c_string", rows[0]["COLUMN_NAME"]);
+            Assert.Equal("c_int", rows[1]["COLUMN_NAME"]);
+
+            // The identifier columns reflect the server's canonical (lowercase) values, not the
+            // uppercase input. TestTable/TestSchema/TestCatalog are the canonical lowercase forms.
+            foreach (var row in rows)
+            {
+                Assert.Equal(TestTable, row["TABLE_NAME"]);
+                Assert.Equal(TestSchema, row["TABLE_SCHEM"]);
+                Assert.Equal(TestCatalog, row["TABLE_CAT"]);
+            }
         }
 
         // --- GetTableSchema ---

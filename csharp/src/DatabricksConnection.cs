@@ -75,6 +75,7 @@ namespace AdbcDrivers.Databricks
         private bool _applySSPWithQueries = false;
         private bool _enableDirectResults = true;
         private bool _enableMultipleCatalogSupport = true;
+        private bool _scopeCurrentCatalog = false;
         private bool _enablePKFK = true;
         private bool _runAsyncInThrift = true;
         private bool _enableComplexDatatypeSupport = false;
@@ -86,7 +87,7 @@ namespace AdbcDrivers.Databricks
         private long _directResultMaxRows = DefaultDirectResultMaxRows;
         // CloudFetch configuration
         private const long DefaultMaxBytesPerFile = 20 * 1024 * 1024; // 20MB
-        private const int DefaultQueryTimeSeconds = 3 * 60 * 60; // 3 hours
+        private const int DefaultQueryTimeSeconds = DatabricksConstants.DefaultQueryTimeoutSeconds; // 3 hours (shared with SEA path)
         private bool _useCloudFetch = true;
         private bool _canDecompressLz4 = true;
         private long _maxBytesPerFile = DefaultMaxBytesPerFile;
@@ -207,6 +208,7 @@ namespace AdbcDrivers.Databricks
         {
             _enablePKFK = PropertyHelper.GetBooleanPropertyWithValidation(Properties, DatabricksParameters.EnablePKFK, _enablePKFK);
             _enableMultipleCatalogSupport = PropertyHelper.GetBooleanPropertyWithValidation(Properties, DatabricksParameters.EnableMultipleCatalogSupport, _enableMultipleCatalogSupport);
+            _scopeCurrentCatalog = PropertyHelper.GetBooleanPropertyWithValidation(Properties, DatabricksParameters.ScopeCurrentCatalog, _scopeCurrentCatalog);
             _applySSPWithQueries = PropertyHelper.GetBooleanPropertyWithValidation(Properties, DatabricksParameters.ApplySSPWithQueries, _applySSPWithQueries);
             _enableDirectResults = PropertyHelper.GetBooleanPropertyWithValidation(Properties, DatabricksParameters.EnableDirectResults, _enableDirectResults);
 
@@ -361,6 +363,33 @@ namespace AdbcDrivers.Databricks
         /// Gets the default namespace to use for SQL queries.
         /// </summary>
         internal TNamespace? DefaultNamespace => _defaultNamespace;
+
+        /// <summary>
+        /// Whether statement-level catalog scoping (adbc.databricks.scope_current_catalog) is opted in.
+        /// </summary>
+        internal bool ScopeCurrentCatalog => _scopeCurrentCatalog;
+
+        // The session's current catalog, so a statement-level USE CATALOG (see
+        // DatabricksStatement.EnsureCatalogScopedAsync) is issued only when the target differs —
+        // matching the ODBC driver, which issues USE CATALOG on change, not per query. Seeded once
+        // from the open-time namespace (UpdateCurrentCatalog, called at session open) and thereafter
+        // mutated only by a USE CATALOG the driver itself issues; a user's own USE CATALOG in
+        // native SQL is not observed (accepted, opt-in-only staleness). Volatile for cross-thread
+        // visibility on a shared connection.
+        private string? _currentCatalog;
+
+        /// <summary>
+        /// The session's current catalog, seeded from the open-time namespace and updated whenever
+        /// the driver issues a USE CATALOG on this connection.
+        /// </summary>
+        internal string? CurrentCatalog => Volatile.Read(ref _currentCatalog);
+
+        /// <summary>
+        /// Records the session's current catalog — both the one-time seed from the open-time
+        /// namespace and each subsequent change after the driver issues a USE CATALOG, so a
+        /// statement skips a redundant USE CATALOG to the catalog already in effect.
+        /// </summary>
+        internal void UpdateCurrentCatalog(string? catalog) => Volatile.Write(ref _currentCatalog, HandleSparkCatalog(catalog));
 
         /// <summary>
         /// Gets the heartbeat interval in seconds for long-running operations.
@@ -521,6 +550,10 @@ namespace AdbcDrivers.Databricks
                 _ => Telemetry.Proto.Operation.Types.Type.Unspecified
             };
 
+            // Empty (non-null) tableTypes → match no table types (zero rows); null →
+            // all. This is enforced by the shared HiveServer2 base (see
+            // adbc-drivers/hiveserver2#83), which short-circuits an empty filter before
+            // the RPC. No Databricks-layer handling is required.
             return this.TraceActivity(activity =>
                 _telemetry.ExecuteWithMetadataTelemetry(
                     operationType,
@@ -718,6 +751,10 @@ namespace AdbcDrivers.Databricks
                 ]);
                 await SetSchema(_defaultNamespace.SchemaName);
             }
+
+            // Seed the current-catalog tracker from the open-time namespace so statement-level
+            // catalog scoping (EnsureCatalogScopedAsync) issues USE CATALOG only on a genuine change.
+            UpdateCurrentCatalog(_defaultNamespace?.CatalogName);
 
             // Initialize telemetry after successful session creation
             InitializeTelemetry(activity);
