@@ -503,6 +503,28 @@ namespace AdbcDrivers.Databricks
         /// </summary>
         [FeatureFlagType(FeatureFlagValueKind.Boolean)]
         public const string EnableComplexDatatypeSupport = "adbc.databricks.enable_complex_datatype_support";
+
+        /// <summary>
+        /// Connection option (boolean, default false): opt in to statement-level catalog scoping.
+        /// When enabled, a non-metadata statement whose catalog (adbc.get_metadata.target_catalog,
+        /// i.e. CatalogName) differs from the session's current catalog causes the driver to issue
+        /// a standalone USE CATALOG on the session before executing — so a query using a bare
+        /// 2-level `schema`.`table` name resolves against that catalog. Issued only on change
+        /// (the current catalog is tracked in memory), matching the ODBC driver. When disabled
+        /// (default), no USE CATALOG is issued (pre-fix behavior). Not applied to metadata
+        /// commands, driver-internal statements, the SPARK legacy alias, or when multiple-catalog
+        /// support is off. See ES-2115589.
+        ///
+        /// This scopes session-global state (the server-side current catalog is per session, and
+        /// all statements on one connection share that session) and is best-effort, not
+        /// per-statement isolated: the check-then-USE-CATALOG-then-track sequence is not atomic.
+        /// If two statements run concurrently on the same connection, their USE CATALOG and query
+        /// can interleave, so a query may execute against the other statement's catalog. Do not
+        /// assume per-statement catalog isolation when executing statements concurrently on a
+        /// single connection.
+        /// </summary>
+        [FeatureFlagType(FeatureFlagValueKind.Boolean)]
+        public const string ScopeCurrentCatalog = "adbc.databricks.scope_current_catalog";
     }
 
     /// <summary>

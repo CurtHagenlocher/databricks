@@ -80,6 +80,11 @@ namespace AdbcDrivers.Databricks.StatementExecution
         private bool _statementClosedByServer;
         private string? _sqlQuery;
 
+        // Marks a driver-internal statement (e.g. the USE CATALOG issued by EnsureCatalogScopedAsync).
+        // Mirrors DatabricksStatement.IsInternalCall on Thrift: it prevents catalog-scoping recursion
+        // (an internal statement must not itself trigger another USE CATALOG).
+        internal bool IsInternalCall { get; set; }
+
         // Cancel support
         private readonly object _cancelLock = new();
         private CancellationTokenSource? _executeCts;
@@ -325,8 +330,62 @@ namespace AdbcDrivers.Databricks.StatementExecution
             }
         }
 
+        /// <summary>
+        /// When statement-level catalog scoping is opted in (connection ScopeCurrentCatalog flag)
+        /// and this statement's catalog (_metadataCatalogName, from adbc.get_metadata.target_catalog)
+        /// differs from the session's current catalog, run USE CATALOG on the SEA session before
+        /// the query so a 2-level name resolves. Issued only on change (matching ODBC's
+        /// issue-on-change). Skipped when multi-catalog support is off, the catalog is empty, the
+        /// metadata command flag is set, or the SPARK default-catalog alias. Mirrors the Thrift
+        /// path: it runs on a throwaway statement over the same session. See ES-2115589.
+        /// </summary>
+        private async Task EnsureCatalogScopedAsync(CancellationToken cancellationToken)
+        {
+            if (_isMetadataCommand
+                || IsInternalCall
+                || !_connection.ScopeCurrentCatalog
+                || !_connection.EnableMultipleCatalogSupport)
+            {
+                return;
+            }
+
+            string? catalog = DatabricksConnection.HandleSparkCatalog(_metadataCatalogName);
+            if (string.IsNullOrEmpty(catalog))
+            {
+                return;
+            }
+
+            // Issue-on-change: skip if the session is already on this catalog (ODBC parity).
+            if (string.Equals(_connection.CurrentCatalog, catalog, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            // Run USE CATALOG on a throwaway statement over the same session, mirroring the Thrift
+            // path (DatabricksStatement.EnsureCatalogScopedAsync). Going through the normal execute
+            // path means the switch is polled to a terminal state before we proceed — a plain
+            // client call only throws on FAILED and returns PENDING/RUNNING under wait_timeout "0s"
+            // (enable_direct_results=false), which would let the query run against the old catalog.
+            // IsInternalCall marks the throwaway so it never recurses into scoping, and its own
+            // server-side handle is released by Dispose (distinct from this statement's).
+            using var useStatement = (StatementExecutionStatement)_connection.CreateStatement();
+            useStatement.SqlQuery = $"USE CATALOG `{catalog!.Replace("`", "``")}`";
+            useStatement.IsInternalCall = true;
+            await useStatement.ExecuteUpdateAsync(cancellationToken).ConfigureAwait(false);
+
+            // Record the change only after the server confirmed it, so a later statement doesn't
+            // skip USE CATALOG and resolve against a catalog that never actually took effect.
+            _connection.UpdateCurrentCatalog(catalog);
+        }
+
         private async Task<QueryResult> ExecuteQueryInternalAsync(CancellationToken cancellationToken, bool isMetadataExecution)
         {
+            // If the caller explicitly scoped this statement to a catalog, set the session's
+            // current catalog first via USE CATALOG so a 2-level `schema`.`table` name
+            // resolves. The server rejects catalog+session_id together, and SEA always uses a
+            // session, so per-request Catalog can't be used here. See ES-2115589.
+            await EnsureCatalogScopedAsync(cancellationToken).ConfigureAwait(false);
+
             // Build the execute statement request
             // Note: warehouse_id is always required by the Databricks Statement Execution API
             // Note: catalog/schema cannot be set when session_id is provided (session has context)
@@ -684,6 +743,10 @@ namespace AdbcDrivers.Databricks.StatementExecution
 
         private async Task<UpdateResult> ExecuteUpdateInternalAsync(CancellationToken cancellationToken)
         {
+            // Scope the session to the caller's catalog first (see ExecuteQueryInternalAsync), so a
+            // DML statement with a bare 2-level `schema`.`table` name resolves against it too.
+            await EnsureCatalogScopedAsync(cancellationToken).ConfigureAwait(false);
+
             // Build the execute statement request
             // Note: catalog/schema cannot be set when session_id is provided (session has context)
             var request = new ExecuteStatementRequest
