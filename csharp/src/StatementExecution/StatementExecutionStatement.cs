@@ -1942,10 +1942,41 @@ namespace AdbcDrivers.Databricks.StatementExecution
                     for (int i = 0; i < batch.Length; i++)
                     {
                         if (fkColArray.IsNull(i)) continue;
+
+                        // Raw server-provided parent identifiers, null when the column is
+                        // absent or NULL for this row. Filtering compares against these raw
+                        // values (not the value-population fallback below) so a requested
+                        // parent can never match a null server column against itself.
+                        string? srvPkCatalog = pkCatalogArray != null && !pkCatalogArray.IsNull(i) ? pkCatalogArray.GetString(i) : null;
+                        string? srvPkSchema = pkSchemaArray != null && !pkSchemaArray.IsNull(i) ? pkSchemaArray.GetString(i) : null;
+                        string? srvPkTable = pkTableArray != null && !pkTableArray.IsNull(i) ? pkTableArray.GetString(i) : null;
+
+                        // SHOW FOREIGN KEYS is scoped to the FOREIGN table only, so it returns
+                        // FKs to every parent. When the caller specified parent identifiers,
+                        // filter the rows down to that parent — mirroring the JDBC reference
+                        // driver (CrossReferenceKeysDatabricksResultSetAdapter.includeRow), which
+                        // keeps a row only when its parent catalog/schema/table equalsIgnoreCase
+                        // the requested one. A null parent arg means "no parent constraint" (the
+                        // GetColumnsExtended foreign-only reuse passes null on all three), so it
+                        // is NOT a filter; a specified parent that the server row doesn't match
+                        // (including a null/empty server value) filters the row out.
+                        if (!ParentMatches(pkCatalog, srvPkCatalog)
+                            || !ParentMatches(pkSchema, srvPkSchema)
+                            || !ParentMatches(pkTable, srvPkTable))
+                        {
+                            continue;
+                        }
+
+                        // Value population: fall back to the requested parent value when the
+                        // server column is null so the emitted row still carries an identifier.
+                        var rowPkCatalog = srvPkCatalog ?? pkCatalog ?? "";
+                        var rowPkSchema = srvPkSchema ?? pkSchema ?? "";
+                        var rowPkTable = srvPkTable ?? pkTable ?? "";
+
                         refs.Add((
-                            pkCatalogArray != null && !pkCatalogArray.IsNull(i) ? pkCatalogArray.GetString(i) : pkCatalog ?? "",
-                            pkSchemaArray != null && !pkSchemaArray.IsNull(i) ? pkSchemaArray.GetString(i) : pkSchema ?? "",
-                            pkTableArray != null && !pkTableArray.IsNull(i) ? pkTableArray.GetString(i) : pkTable ?? "",
+                            rowPkCatalog,
+                            rowPkSchema,
+                            rowPkTable,
                             pkColArray != null && !pkColArray.IsNull(i) ? pkColArray.GetString(i) : "",
                             fkCatalogArray != null && !fkCatalogArray.IsNull(i) ? fkCatalogArray.GetString(i) : fkCatalog!,
                             fkSchemaArray != null && !fkSchemaArray.IsNull(i) ? fkSchemaArray.GetString(i) : fkSchema!,
@@ -1971,6 +2002,17 @@ namespace AdbcDrivers.Databricks.StatementExecution
             try { return batch.Column(name) as T; }
             catch (ArgumentOutOfRangeException) { return null; }
         }
+
+        /// <summary>
+        /// Cross-reference parent-identifier filter. A null <paramref name="requested"/> means
+        /// "no parent constraint" (matches any row); a specified value matches case-insensitively,
+        /// mirroring the JDBC reference driver's CrossReferenceKeysDatabricksResultSetAdapter.
+        /// An empty-string requested value therefore matches only an empty-string row value —
+        /// which no real FK has — so it correctly filters everything out. A null row value
+        /// (server column absent/NULL) never matches a specified parent.
+        /// </summary>
+        private static bool ParentMatches(string? requested, string? rowValue)
+            => requested == null || (rowValue != null && string.Equals(requested, rowValue, StringComparison.OrdinalIgnoreCase));
 
         // TracingStatement implementation
         public override string AssemblyVersion => GetType().Assembly.GetName().Version?.ToString() ?? "1.0.0";
