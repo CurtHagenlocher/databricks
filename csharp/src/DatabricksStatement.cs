@@ -886,7 +886,13 @@ namespace AdbcDrivers.Databricks
                 QueryResult result = await base.GetTablesAsync(cancellationToken);
                 activity?.SetTag(SemanticConventions.Db.Response.ReturnedRows, result.RowCount);
                 activity?.AddEvent("statement.get_tables.complete");
-                return result;
+                // Match databricks-jdbc (MetadataResultSetBuilder): substitute "TABLE" for any
+                // null/empty TABLE_TYPE the Thrift GetTables path leaves empty — e.g. legacy
+                // hive_metastore tables in a broad enumeration. See TableTypeDefaultingStream.
+                // Guard a null stream (mirrors MaybeWrapComplexTypes) so a null-stream base
+                // result is passed through rather than converted into a thrown exception.
+                if (result.Stream == null) return result;
+                return new QueryResult(result.RowCount, new TableTypeDefaultingStream(result.Stream));
             }, activityName: "GetTables");
         }
 
@@ -1022,10 +1028,31 @@ namespace AdbcDrivers.Databricks
                 }
 
                 activity?.AddEvent("statement.get_cross_reference.calling_base_implementation");
-                QueryResult result = await base.GetCrossReferenceAsync(cancellationToken);
-                activity?.SetTag(SemanticConventions.Db.Response.ReturnedRows, result.RowCount);
-                activity?.AddEvent("statement.get_cross_reference.complete");
-                return result;
+                try
+                {
+                    QueryResult result = await base.GetCrossReferenceAsync(cancellationToken);
+                    activity?.SetTag(SemanticConventions.Db.Response.ReturnedRows, result.RowCount);
+                    activity?.AddEvent("statement.get_cross_reference.complete");
+                    return result;
+                }
+                catch (AdbcException ex) when (DatabricksException.IsObjectNotFoundException(ex))
+                {
+                    // The Thrift server rejects an object-not-found / invalid-name argument
+                    // (e.g. an empty-string parent catalog: TGetCrossReferenceReq sends
+                    // ParentCatalogName="" and the server throws TABLE_OR_VIEW_NOT_FOUND /
+                    // INVALID_PARAMETER_VALUE). Per the JDBC spec — and matching the JDBC
+                    // reference driver (DatabricksThriftServiceClient.listCrossReferences, which
+                    // catches isObjectNotFoundException) as well as this driver's SEA path —
+                    // metadata methods return an EMPTY result for a non-existent / invalid object
+                    // rather than throwing.
+                    activity?.AddEvent("statement.get_cross_reference.object_not_found_returning_empty", [
+                        new("sql_state", ex.SqlState ?? "(none)"),
+                        new("error_message", ex.Message)
+                    ]);
+                    activity?.SetTag(SemanticConventions.Db.Response.ReturnedRows, 0);
+                    activity?.AddEvent("statement.get_cross_reference.complete");
+                    return EmptyCrossReferenceResult();
+                }
             }, activityName: "GetCrossReference");
         }
 

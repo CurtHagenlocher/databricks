@@ -93,6 +93,10 @@ namespace AdbcDrivers.Databricks.StatementExecution
         private bool _isMetadataCommand;
         private bool _escapePatternWildcards;
         private string? _metadataCatalogName;
+        // Whether the caller explicitly set the (parent) catalog via adbc.get_metadata.target_catalog.
+        // _metadataCatalogName is otherwise seeded from the connection's default catalog at construction,
+        // so it cannot serve as a "caller supplied a parent catalog" signal in GetCrossReference.
+        private bool _metadataCatalogSet;
         private string? _metadataSchemaName;
         private string? _metadataTableName;
         private string? _metadataColumnName;
@@ -221,6 +225,7 @@ namespace AdbcDrivers.Databricks.StatementExecution
                     break;
                 case ApacheParameters.CatalogName:
                     _metadataCatalogName = value;
+                    _metadataCatalogSet = true;
                     break;
                 case ApacheParameters.SchemaName:
                     _metadataSchemaName = value;
@@ -470,6 +475,12 @@ namespace AdbcDrivers.Databricks.StatementExecution
             // IntervalSerializingStream and ComplexTypeSerializingStream can detect columns
             // uniformly via Spark:DataType:SqlName metadata rather than Arrow IPC types.
             IArrowArrayStream reader = CreateReader(response, cancellationToken);
+
+            // An untyped-NULL column (SQL type VOID, e.g. `SELECT NULL`) arrives as an Arrow
+            // NullArray but the manifest schema declares it as StringType (to match Thrift, which
+            // reports STRING for untyped NULL). Convert the NullArray to an all-null StringArray so
+            // the declared schema and the batch array agree.
+            reader = new NullColumnSerializingStream(reader);
 
             // SEA emits YearMonthIntervalType and DurationType; Thrift emits StringType for intervals.
             // Convert interval/duration columns to canonical UTF-8 strings to match Thrift behavior.
@@ -1860,8 +1871,14 @@ namespace AdbcDrivers.Databricks.StatementExecution
                 throw NewInvalidArgumentException("schema may not be null when catalog is specified");
             }
 
+            // Pass the parent catalog to the filter ONLY when the caller explicitly supplied it. When
+            // unset, _metadataCatalogName holds the connection's seeded default catalog; using it as the
+            // parent-catalog filter (added in the ParentMatches step) wrongly drops every FK whose real
+            // parent is in another catalog — e.g. getImportedKeys (no parent supplied) returns empty while
+            // Thrift returns the row. Parent schema/table are not seeded, so they already no-op when unset
+            // and are passed through as-is; only the catalog needs this guard.
             return await GetCrossReferenceAsyncNoThrow(
-                _metadataCatalogName, _metadataSchemaName, _metadataTableName,
+                _metadataCatalogSet ? _metadataCatalogName : null, _metadataSchemaName, _metadataTableName,
                 _metadataForeignCatalogName, _metadataForeignSchemaName, _metadataForeignTableName,
                 cancellationToken).ConfigureAwait(false);
         }
@@ -1936,10 +1953,41 @@ namespace AdbcDrivers.Databricks.StatementExecution
                     for (int i = 0; i < batch.Length; i++)
                     {
                         if (fkColArray.IsNull(i)) continue;
+
+                        // Raw server-provided parent identifiers, null when the column is
+                        // absent or NULL for this row. Filtering compares against these raw
+                        // values (not the value-population fallback below) so a requested
+                        // parent can never match a null server column against itself.
+                        string? srvPkCatalog = pkCatalogArray != null && !pkCatalogArray.IsNull(i) ? pkCatalogArray.GetString(i) : null;
+                        string? srvPkSchema = pkSchemaArray != null && !pkSchemaArray.IsNull(i) ? pkSchemaArray.GetString(i) : null;
+                        string? srvPkTable = pkTableArray != null && !pkTableArray.IsNull(i) ? pkTableArray.GetString(i) : null;
+
+                        // SHOW FOREIGN KEYS is scoped to the FOREIGN table only, so it returns
+                        // FKs to every parent. When the caller specified parent identifiers,
+                        // filter the rows down to that parent — mirroring the JDBC reference
+                        // driver (CrossReferenceKeysDatabricksResultSetAdapter.includeRow), which
+                        // keeps a row only when its parent catalog/schema/table equalsIgnoreCase
+                        // the requested one. A null parent arg means "no parent constraint" (the
+                        // GetColumnsExtended foreign-only reuse passes null on all three), so it
+                        // is NOT a filter; a specified parent that the server row doesn't match
+                        // (including a null/empty server value) filters the row out.
+                        if (!ParentMatches(pkCatalog, srvPkCatalog)
+                            || !ParentMatches(pkSchema, srvPkSchema)
+                            || !ParentMatches(pkTable, srvPkTable))
+                        {
+                            continue;
+                        }
+
+                        // Value population: fall back to the requested parent value when the
+                        // server column is null so the emitted row still carries an identifier.
+                        var rowPkCatalog = srvPkCatalog ?? pkCatalog ?? "";
+                        var rowPkSchema = srvPkSchema ?? pkSchema ?? "";
+                        var rowPkTable = srvPkTable ?? pkTable ?? "";
+
                         refs.Add((
-                            pkCatalogArray != null && !pkCatalogArray.IsNull(i) ? pkCatalogArray.GetString(i) : pkCatalog ?? "",
-                            pkSchemaArray != null && !pkSchemaArray.IsNull(i) ? pkSchemaArray.GetString(i) : pkSchema ?? "",
-                            pkTableArray != null && !pkTableArray.IsNull(i) ? pkTableArray.GetString(i) : pkTable ?? "",
+                            rowPkCatalog,
+                            rowPkSchema,
+                            rowPkTable,
                             pkColArray != null && !pkColArray.IsNull(i) ? pkColArray.GetString(i) : "",
                             fkCatalogArray != null && !fkCatalogArray.IsNull(i) ? fkCatalogArray.GetString(i) : fkCatalog!,
                             fkSchemaArray != null && !fkSchemaArray.IsNull(i) ? fkSchemaArray.GetString(i) : fkSchema!,
@@ -1965,6 +2013,17 @@ namespace AdbcDrivers.Databricks.StatementExecution
             try { return batch.Column(name) as T; }
             catch (ArgumentOutOfRangeException) { return null; }
         }
+
+        /// <summary>
+        /// Cross-reference parent-identifier filter. A null <paramref name="requested"/> means
+        /// "no parent constraint" (matches any row); a specified value matches case-insensitively,
+        /// mirroring the JDBC reference driver's CrossReferenceKeysDatabricksResultSetAdapter.
+        /// An empty-string requested value therefore matches only an empty-string row value —
+        /// which no real FK has — so it correctly filters everything out. A null row value
+        /// (server column absent/NULL) never matches a specified parent.
+        /// </summary>
+        private static bool ParentMatches(string? requested, string? rowValue)
+            => requested == null || (rowValue != null && string.Equals(requested, rowValue, StringComparison.OrdinalIgnoreCase));
 
         // TracingStatement implementation
         public override string AssemblyVersion => GetType().Assembly.GetName().Version?.ToString() ?? "1.0.0";
